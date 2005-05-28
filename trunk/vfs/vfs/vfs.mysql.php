@@ -16,6 +16,8 @@ You should have received a copy of the GNU Lesser General Public
 License along with this library; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA */
 
+// This is the PHP5 version. It is not compatable with PHP4 due to class method differences.
+
 /* MySQL structure
 	directories
 	---
@@ -38,43 +40,44 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA *
 	
 	
 	Notes: Files will be split into 50kb blocks (after formatting). Defragmentation may or may not be nessicary.
+		Important! Using a real filesystem as an intermediate will probably slow this down a lot. We'll need to clean all commands up to run internally, eventually.
 */
 
 /* Global variables for VFS+MySQL:
-	vfs_mysql_host		Hostname of the mySQL server			Can be overwritten by URI
+	vfs_mysql_host		Hostname of the mySQL server			Required
 	vfs_mysql_username	Username to access the mySQL server		Required
 	vfs_mysql_password	Password of the user					Required
 	vfs_mysql_database	Database to use							Required
 	vfs_mysql_prefix	Prefix for the tables					Required
 */
 
-// How to use it: example_command("vfs+mysql://fsname@host/directory/file.ext");
+// How to use it: example_command("vfs+mysql://fsname/directory/file.ext");
 stream_wrapper_register("vfs+mysql","VFS_MySQL") or die("Failed to register VFS+MySQL wrapper.");
 
 class VFS_MySQL {
-	var $usegzip = true;	// GZIP files before putting in database?
+	public $usegzip = true;	// GZIP files before putting in database?
 
-	var $mysql;
-	var $thiserror = false;
-	var $fpath;
-	var $fmode;
-	var $foptions;
-	var $fopened_path;
-	var $fpointer;
-	var $fakepath;
+	public $mysql;
+	private $thiserror = false;
+	private $fpath;
+	private $fmode;
+	private $foptions;
+	private $fopened_path;
+	private $fpointer;
+	private $fakepath;
 	
-	var $fsname = "default";
+	public $fsname = "default";
 
-	public function _constructor() {
+	public function __constructor() {
 		if ($GLOBALS["vfs_mysql_host"] == "") { $host = "localhost"; } else { $host = $GLOBALS["vfs_mysql_host"]);
 		if ($GLOBALS["vfs_mysql_username"] == "") { $username = "root"; } else { $username = $GLOBALS["vfs_mysql_username"]);
 		if ($GLOBALS["vfs_mysql_database"] == "") { trigger_error("Cannot have a blank database.",E_USER_ERROR); } else { $database = $GLOBALS["vfs_mysql_database"]; }
 		if ($GLOBALS["vfs_mysql_password"] == "") { $password = ""; } else { $password = $GLOBALS["vfs_mysql_password"]);
 		if ($GLOBALS["vfs_mysql_prefix"] == "") { $prefix = ""; } else { $prefix = $GLOBALS["vfs_mysql_prefix"]; }
-		$this->mysql = mysql_connect($host,$username,$password);
-		mysql_select_db($database);
+		$this->mysql = mysql_connect($host,$username,$password) or $this->raiseMySQLError();
+		mysql_select_db($database) or $this->raiseMySQLError();
 	}
-	public function _destructor() {
+	public function __destructor() {
 		mysql_close($this->mysql);
 	}
     public function stream_open($path,$mode,$options,$opened_path)
@@ -175,21 +178,40 @@ class VFS_MySQL {
 	// This creates a new filesystem on the VFS
 	public function VFS_CreateFS($name) {
 		// Create directory table
-		$sql = "CREATE TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_directories` (";
-		// Blah blah, finish me
-		$sql .= ");";
+		$sql = "DROP TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_directories`;" .
+				"CREATE TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_directories` (" .
+				"`id` INT NOT NULL AUTO_INCREMENT ," .
+				"`parent` INT NOT NULL ," .
+				"`name` VARCHAR( 255 ) NOT NULL ," .
+				"UNIQUE (`id`)" .
+				") TYPE = MYISAM COMMENT = '".$name." directory table';"
+		
+		// Create the root directory, without this the system will fail!
+		$sql = "INSERT INTO `".$GLOBALS["mysql_vfs_prefix"].$name."_directories` VALUES ('0', '0', '(root)');";
 		
 		// Create file data table
-		$sql .= "CREATE TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_files` (";
-		// Blah blah, finish me
-		$sql .= ");";
+		$sql .= "DROP TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_files`;" .
+				"CREATE TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_files` (" .
+				"`id` INT NOT NULL AUTO_INCREMENT ," .
+				"`data` LONGBLOB NOT NULL ," .
+				"`nextblock` INT NOT NULL ," .
+				"UNIQUE (`id`)" .
+				") TYPE = MYISAM COMMENT = '".$name." file data table';";
 
 		// Create FAT table
-		$sql = "CREATE TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_fat` (";
-		// Blah blah, finish me
-		$sql .= ");";
+		$sql = "DROP TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_fat`;" .
+				"CREATE TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_fat` (" .
+				"`id` INT NOT NULL AUTO_INCREMENT ," .
+				"`dir` INT NOT NULL ," .
+				"`name` VARCHAR( 255 ) NOT NULL ," .
+				"`flags` VARCHAR( 255 ) NOT NULL , " .
+				"`atime` INT NOT NULL , " .
+				"`mtime` INT NOT NULL , " .
+				"UNIQUE (`id`)" .
+				") TYPE = MYISAM COMMENT = 'vol1 file allocation table';";
 
-		mysql_query($sql);
+		$query = mysql_query($sql);
+		if ($query) { return true; } else { return false; $this->raiseMySQLError(); }
 	}
 	
 	// Imports a set of real directories into the VFS
@@ -201,13 +223,17 @@ class VFS_MySQL {
 	public function VFS_Export($srcpath,$destpath) {
 		
 	}
+	
+	// mySQL error handler
+	public function raiseMySQLError() {
+		trigger_error("Problem with mySQL: ".mysql_error(),E_USER_ERROR);
+	}
 
 	// Breaks apart a path for use
 	public function BreakApartPath($path) {
 		$parsed = parse_url($path);
 		if ($parsed["scheme"] != "vfs+mysql") { die("Bad scheme!"); /* How'd this happen?!? */ }
-		if ($parsed["username"] != "") { $this->fsname = $parsed["username"]; }
-		if ($parsed["host"] != "") { $GLOBALS["vfs_mysql_host"] = $parsed["host"]; }
+		if ($parsed["host"] != "") { $this->fsname = $parsed["username"]; }
 		if ($parsed["path"] == "") { die("No path"); /* Do something about it */ }
 			else { return $parsed["path"]; }
 	}
@@ -250,7 +276,7 @@ class VFS_MySQL {
 			$lastdir = 0;	// Start at root
 			for ($i = 0; $i < count($dirs); $i++) {
 				$parent = "`parent`='".$lastdir."' AND ";
-				$query = mysql_query("SELECT * FROM `".$this->buildTableName("directories")."` WHERE (".$parent."`name`='".$dirs[$i]."')");
+				$query = mysql_query("SELECT * FROM `".$this->buildTableName("directories")."` WHERE (".$parent."`name`='".$dirs[$i]."')") or $this->raiseMySQLError();
 				if (mysql_num_rows($query) == 0) { return false; /* Directory not found */ }
 				$result = mysql_fetch_assoc($query);
 				$lastdir = $result["id"];
@@ -261,7 +287,7 @@ class VFS_MySQL {
 	
 	// Finds the file number entry in the FAT
 	private function FindFileID($dirid,$filename) {
-		$query = mysql_query("SELECT * FROM `".$this->buildTableName("fat")."` WHERE (`filename`='".$filename."' AND `dir`='".$dirid."')");
+		$query = mysql_query("SELECT * FROM `".$this->buildTableName("fat")."` WHERE (`filename`='".$filename."' AND `dir`='".$dirid."')") or $this->raiseMySQLError();
 		if (mysql_num_rows($query) == 0) { return false; /* File not found */ }
 		$result = mysql_fetch_assoc($query);
 		return $result["id"];
