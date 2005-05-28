@@ -1,4 +1,4 @@
-<?php // $Id: $
+<?php // $Id$
 /* PHP-vfs, a virtual file system for PHP5
 Copyright (C) 2005  Andrew Koester
 
