@@ -1,6 +1,6 @@
 <?php // $Id$
 /* PHP-vfs, a virtual file system for PHP5
-Copyright (C) 2005  Andrew Koester
+Written by: Andrew Koester
 
 This library is free software; you can redistribute it and/or
 modify it under the terms of the GNU Lesser General Public
@@ -27,20 +27,19 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA *
 	
 	files
 	---
-	id		data	nextblock
-	0		aadga	1
-	1		aga00b	-1
+	id		data
+	0		aadga
+	1		aga00b
 	
 	fat
 	---
-	id		dir		name		flags	atime	mtime
-	0		0		mew.txt		uu		351351	312654
-	1		0		whee.bat			351351	312654
-	2		1		hee.jpg		uu gz	351351	312654
+	id		dir		name		flags	ctime	atime	mtime
+	0		0		mew.txt				35131	351351	312654
+	1		0		whee.bat	b64		35132	351351	312654
+	2		1		hee.jpg		gz:b64	32510	351351	312654
 	
 	
-	Notes: Files will be split into 50kb blocks (after formatting). Defragmentation may or may not be nessicary.
-		Important! Using a real filesystem as an intermediate will probably slow this down a lot. We'll need to clean all commands up to run internally, eventually.
+	Notes: Files will be split into 500kb blocks (after formatting). Defragmentation may or may not be nessicary.
 */
 
 /* Global variables for VFS+MySQL:
@@ -54,17 +53,27 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA *
 // How to use it: example_command("vfs+mysql://fsname/directory/file.ext");
 stream_wrapper_register("vfs+mysql","VFS_MySQL") or die("Failed to register VFS+MySQL wrapper.");
 
-class VFS_MySQL {
-	public $usegzip = true;	// GZIP files before putting in database?
+// Defines
+define("_FLAG_SEPERATOR_",":");
+define("FLAG_GZIP","gz");
+define("FLAG_BASE64","b64");
 
-	public $mysql;
-	private $thiserror = false;
-	private $fpath;
-	private $fmode;
-	private $foptions;
-	private $fopened_path;
-	private $fpointer;
-	private $fakepath;
+// Class definition
+class VFS_MySQL {
+	public $usebase64 = true;		// Use base64? Recommended.
+	public $usegzip = true;			// GZIP files before putting in database?
+	public $gziplevel = 5;			// GZIP compression level
+
+	public $mysql;					// mySQL resource
+	private $thiserror = false;		// Error
+	private $doerror = true;		// Should we raise errors? (stream_open option)
+	private $fpath;					// stream_open $path
+	private $fmode;					// stream_open $mode
+	private $foptions;				// stream_open $options
+	private $fopened_path;			// stream_open $opened_path
+	private $filedata;				// In-stream file contents
+	private $fileopenchecksum;		// Checksum of the data after opening, operations
+	private $fileposition;			// File 'pointer' position
 	
 	public $fsname = "default";
 
@@ -95,30 +104,86 @@ class VFS_MySQL {
 		// Return true or false depending on mySQL success
 		// File modes are important later on to what we do with it
 		//  (Ex. if we wrote, we may want to re-upload the file -- md5 check for diff?)
-		$this->fpointer = fopen($this->fakepath,$mode);
+		$pathinfo = pathinfo($this->path);
+		$dirid = $this->FindDirID($pathinfo["dirname"]);
+		if ($dirid === false) { /* Do something */ die("Directory not found"); }
+		$fileid = $this->FindFileID($dirid,$pathinfo["basename"]);
+		if ($fileid === false) {
+			// Create the file in the database
+			
+			// Blank the filedata string
+			$this->filedata = "";
+		}
+		else {
+			$this->filedata = $this->ReadWholeFile($fileid);
+		}
+
+		$this->fileopenchecksum = md5($this->filedata);
+		
+		// Reset the file pointer position
+		$this->fileposition = 0;
 	}
 	public function stream_close() {
-		// We close connection on destruction
-		// We will want to perform re-upload if nessicary
-		return fclose($this->fpointer);
+		// Clear the data
+		$this->filedata = 0;
 	}
 	public function stream_read($count) {
-		return fread($this->fpointer,$count);
+		$data = substr($this->filedata, $this->fileposition, $count);
+		$this->fileposition += strlen($data);
+		return $data;
 	}
 	public function stream_write($data) {
-		return fwrite($this->fpointer,$data);
+		$leftside = substr($this->filedata, 0, $this->fileposition);
+		$rightside = substr($this->filedata, ($this->fileposition + strlen($data)));
+		$this->filedata = $leftside.$data.$rightside;
+		$this->fileposition += strlen($data);
+		return strlen($data);
 	}
 	public function stream_eof() {
-		return feof($this->fpointer);
+		return $this->fileposition >= strlen($this->filedata);
 	}
 	public function stream_tell() {
-		return ftell($this->fpointer);
+		return $this->fileposition;
 	}
 	public function stream_seek($offset,$whence) {
-		return fseek($this->fhandle,$offset,$whence)
+		switch ($whence) {
+			case SEEK_SET:
+				if (($offset < strlen($this->filedata)) && ($offset >= 0)) {
+					$this->fileposition = $offset;
+					return true;
+				}
+				else { return false; }
+				break;
+			case SEEK_CUR:
+				if ($offset >= 0) {
+					$this->fileposition += $offset;
+					return true;
+				}
+				else { return false; }
+				break;
+			case SEEK_END:
+				if ((strlen($this->filedata) + $offset) >= 0) {
+					return true;
+				}
+				else { return false; }
+				break;
 	}
 	public function stream_flush() {
-		return fflush($this->fhandle);
+		// We will want to perform re-upload if nessicary
+		if (md5($this->filedata) != $this->fileopenchecksum) {
+			// File content has changed, we need to re-upload it
+			// Re-encode and stuff
+			$data = $this->filedata;
+			if ($this->usegzip) {
+				$data = gzcompress($data,$gziplevel);
+			}
+			if ($this->usebase64) {
+				$data = base64_encode($data);
+			}
+			// Deal with GC for un-needed IDs
+			// Send the data to the server
+			// Update the mtime
+		}
 	}
 	/*public function stream_stat() {
 		trigger_error("Cannot use fstat with this resource.",E_USER_ERROR);
@@ -143,10 +208,12 @@ class VFS_MySQL {
 	}
 	public function url_stat($path,$flags) {
 		// Flags: STREAM_URL_STAT_LINK  STREAM_URL_STAT_QUIET
-		$dev = 0; $ino = 0; $mode = 0; $nlink = 0; $uid = 0; $gid = 0; $rdev = -1; $ctime = 0; $blksize = -1; $blocks = 0;
+		$dev = 0; $ino = 0; $mode = 0; $nlink = 0; $uid = 0; $gid = 0; $rdev = -1; $blksize = -1; $blocks = 0;
 		$realstat = stat($this->fakepath);
 		$size = $realstat["size"];
-		$atime = 0; // Get the time from mySQL
+		$ctime = 0;	// Get the time from mySQL
+//		$atime = 0; // Get the time from mySQL
+		$atime = 0;	// Unimplemented as of yet
 		$mtime = 0; // Get the time from mySQL
 		
 		$array = array(
@@ -194,7 +261,7 @@ class VFS_MySQL {
 				"CREATE TABLE `".$GLOBALS["mysql_vfs_prefix"].$name."_files` (" .
 				"`id` INT NOT NULL AUTO_INCREMENT ," .
 				"`data` LONGBLOB NOT NULL ," .
-				"`nextblock` INT NOT NULL ," .
+				//"`nextblock` INT NOT NULL ," .
 				"UNIQUE (`id`)" .
 				") TYPE = MYISAM COMMENT = '".$name." file data table';";
 
@@ -205,6 +272,7 @@ class VFS_MySQL {
 				"`dir` INT NOT NULL ," .
 				"`name` VARCHAR( 255 ) NOT NULL ," .
 				"`flags` VARCHAR( 255 ) NOT NULL , " .
+				"`ctime` INT NOT NULL , " .
 				"`atime` INT NOT NULL , " .
 				"`mtime` INT NOT NULL , " .
 				"UNIQUE (`id`)" .
@@ -255,7 +323,25 @@ class VFS_MySQL {
 			$data .= $results["data"];
 		}
 		// Deal with flags and decompression, etc.
+		$flags = explode(":",$results["flags"]);
+		if ($this->CheckForFlag($flags,FLAG_BASE64)) {
+			$data = base64_decode($data);
+		}
+		if ($this->CheckForFlag($flags,FLAG_GZIP)) {
+			$data = gzuncompress($data);
+		}
 		return $data;
+	}
+	
+	// Reads flags from a flag list entry
+	private function CheckForFlag($flags,$flag) {
+		$exploded = explode(_FLAG_SEPERATOR_,$flags);
+		if (in_array($flah,$exploded) {
+			return true;
+		}
+		else {
+			return false;
+		}
 	}
 	
 	// Finds the directory number entry in the directory table
